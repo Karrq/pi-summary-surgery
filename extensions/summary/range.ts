@@ -83,6 +83,12 @@ export function rangePath(source: BranchSource, range: Range): RangePath {
 	return { path, startIndex };
 }
 
+/** The latest content entry on a path, which is where an unmarked range ends. */
+export function lastContentId(path: readonly SessionEntry[]): string | undefined {
+	for (let i = path.length - 1; i >= 0; i--) if (isContentEntry(path[i])) return path[i].id;
+	return undefined;
+}
+
 /** Content-bearing entries of the range, in order. */
 export function sliceRange(source: BranchSource, range: Range): SessionEntry[] {
 	const { path, startIndex } = rangePath(source, range);

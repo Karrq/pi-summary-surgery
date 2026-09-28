@@ -5,7 +5,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, SessionMa
 import { findSummaryHeader, SUMMARY_KIND, SUMMARY_LABEL, type SummaryHeader } from "./header.ts";
 import { pickRange } from "./picker.ts";
 import { SUMMARIZER_SYSTEM_PROMPT, summaryBrief, summaryCard, summaryRequest } from "./prompt.ts";
-import { entryText, type Range, rangePath, sliceRange } from "./range.ts";
+import { entryText, lastContentId, type Range, rangePath, sliceRange } from "./range.ts";
 import { applySettings, describeSettings, editSettings, loadSettings } from "./settings.ts";
 import { registerSectionTools, TOOL_NAMES } from "./tools.ts";
 
@@ -55,7 +55,7 @@ export default function summarySurgery(pi: ExtensionAPI): void {
 
 			let range: Range | undefined;
 			if (parsed.start) {
-				range = { startId: parsed.start, endId: parsed.end ?? ctx.sessionManager.getLeafId() ?? parsed.start };
+				range = { startId: parsed.start, endId: parsed.end ?? lastContentId(ctx.sessionManager.getBranch()) ?? parsed.start };
 			} else if (ctx.hasUI) {
 				range = await pickRange(ctx, {
 					describeSettings: () => describeSettings(settings),

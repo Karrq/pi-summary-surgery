@@ -8,7 +8,7 @@
 import type { ExtensionCommandContext, SessionEntry, SessionTreeNode, Theme } from "@earendil-works/pi-coding-agent";
 import { TreeSelectorComponent } from "@earendil-works/pi-coding-agent";
 import { Container, type Focusable, matchesKey, Text, type TUI } from "@earendil-works/pi-tui";
-import { applyMark, entryKind, entryText, type Range, resolveRange, sliceRange } from "./range.ts";
+import { applyMark, entryKind, entryText, isContentEntry, type Range, resolveRange, sliceRange } from "./range.ts";
 
 export interface PickerOptions {
 	/** Opened on `?`; the picker reopens afterwards with marks and cursor preserved. */
@@ -35,8 +35,10 @@ export async function pickRange(ctx: ExtensionCommandContext, options: PickerOpt
 	for (;;) {
 		const outcome = await ctx.ui.custom<PickerOutcome>((tui, theme, _keybindings, done) => {
 			const labels = new Map(path.map((entry) => [entry.id, ctx.sessionManager.getLabel(entry.id)]));
-			const pathIds = path.map((entry) => entry.id);
-			const leafId = pathIds[pathIds.length - 1];
+			// Marks and the default start/end only land on content entries; the leaf is often
+			// bookkeeping (a label, a model change, an extension's state entry).
+			const pathIds = path.filter(isContentEntry).map((entry) => entry.id);
+			const leafId = path[path.length - 1].id;
 			const selector = new TreeSelectorComponent(
 				prunedTree(path, labels),
 				leafId,
@@ -83,6 +85,7 @@ class RangePicker extends Container implements Focusable {
 	private readonly theme: Theme;
 	private readonly ctx: ExtensionCommandContext;
 	private readonly path: SessionEntry[];
+	/** Content entries only: the ones a mark or a default boundary can land on. */
 	private readonly pathIds: string[];
 	private readonly labels: Map<string, string | undefined>;
 	private readonly describeSettings?: () => string;
@@ -105,7 +108,7 @@ class RangePicker extends Container implements Focusable {
 		this.theme = theme;
 		this.ctx = ctx;
 		this.path = path;
-		this.pathIds = path.map((entry) => entry.id);
+		this.pathIds = path.filter(isContentEntry).map((entry) => entry.id);
 		this.labels = labels;
 		this.marks = marks;
 		this.describeSettings = describeSettings;
@@ -130,7 +133,7 @@ class RangePicker extends Container implements Focusable {
 	handleInput(data: string): void {
 		if (matchesKey(data, "tab")) {
 			const id = this.selectedId();
-			if (id) {
+			if (id && this.pathIds.includes(id)) {
 				this.marks = applyMark(this.pathIds, this.marks, id);
 				this.refresh();
 				this.tui.requestRender();
@@ -168,7 +171,7 @@ class RangePicker extends Container implements Focusable {
 		const chars = entries.reduce((sum, entry) => sum + entryText(entry).length, 0);
 		const size = `${entries.length} entries · ≈${formatTokens(chars / 4)} tokens`;
 		if (this.marks.length === 0) return `whole branch · ${size}`;
-		const endNote = this.marks.length === 1 ? " (leaf)" : "";
+		const endNote = this.marks.length === 1 ? " (latest)" : "";
 		return `${this.describeEntry(range.startId)} → ${this.describeEntry(range.endId)}${endNote} · ${size}`;
 	}
 
