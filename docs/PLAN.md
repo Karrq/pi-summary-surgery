@@ -18,16 +18,18 @@ No subagent, no child process, no session file parsing, no context_edit fan-out.
 main branch ... ─ [leaf] ─┬─ (next user message, after you navigate back)
                           │
                           └─ [compaction: retain-none, §summary]   ← context resets here
-                             └─ [user: summarizer prompt]
-                                └─ [assistant: summary]
-                                   └─ (follow-up Q&A, same clean context)
+                             └─ [custom_message: "Summarizing a → b · N entries · model"]
+                                └─ [user: summarizer request (+ focus)]
+                                   └─ [assistant ↔ section_index / section_read …]
+                                      └─ [assistant: summary]
+                                         └─ (follow-up Q&A, same clean context)
 ```
 
 The compaction entry is the branch header. It carries three things at once:
 
-- `summary` — the brief, which is the only thing in context besides the prompt;
-- `details` — `{ kind: "summary-surgery", startId, endId, model, thinking }`, the durable record of
-  what was marked;
+- `summary` — the brief, which with the card and the request is all that is in context;
+- `details` — `{ kind: "summary-surgery", startId, endId, model, thinking, entryCount,
+  approxTokens }`, the durable record of what was marked;
 - `systemMessage` — the prompt/tool checkpoint pi snapshots automatically.
 
 Everything before it is out of context. Everything about the range is recoverable from it.
@@ -38,19 +40,20 @@ Everything before it is out of context. Everything about the range is recoverabl
 
 | File | Contents |
 |---|---|
-| `index.ts` | extension factory: command, tools, `before_agent_start`, settings load |
-| `range.ts` | branch slicing, ancestry validation, entry previews, index/read primitives |
-| `picker.ts` | `TreeSelectorComponent` wrapper: tab-marking, `[start]`/`[end]` tags, `?` overlay |
+| `index.ts` | extension factory: `/summary`, tool sync, `before_agent_start`, `startSummary` |
+| `range.ts` | mark rules, branch slicing, ancestry validation, entry previews, index/read primitives |
+| `picker.ts` | `TreeSelectorComponent` over a pruned path: tab-marking, `[start]`/`[end]` tags, `?` |
+| `header.ts` | the summary header type and "is there one on this path" |
 | `tools.ts` | `section_index` / `section_read` definitions over `range.ts` |
-| `prompt.ts` | brief text, summarizer prompt, forced system prompt |
-| `settings.ts` | read/write the `summary-surgery` key in `~/.pi/agent/settings.json` |
+| `prompt.ts` | forced system prompt, compaction brief, visible card, request |
+| `settings.ts` | model/thinking overlay, stored in `~/.pi/agent/summary-surgery.json` |
 
 `range.ts` and `picker.ts` know nothing about summarization; they are the reusable half.
 
 ## Data model
 
 ```ts
-type SectionRange = { startId: string; endId: string };
+type Range = { startId: string; endId: string };
 
 type SummaryHeader = {
   kind: "summary-surgery";
@@ -70,16 +73,22 @@ Markers are in-memory only, from picker open to `sendUserMessage`. Their durable
 
 `/summary`:
 
-1. `ctx.waitForIdle()`, then open the picker overlay via `ctx.ui.custom()`.
-2. Picker returns `{ startId, endId }` or cancels. `endId` defaults to the current leaf.
-3. Apply settings: `pi.setActiveTools(["section_index", "section_read"])`, plus
-   `pi.setModel()` / `pi.setThinkingLevel()` if the overlay changed them.
-4. `ctx.sessionManager.appendCompaction(brief, null, tokensBefore, header, true)`.
-   `null` for `firstKeptEntryId` is what makes it retain-none (`session-manager.js:890`
-   stores the entry's own id), so nothing before it survives into context.
+1. `ctx.waitForIdle()`, then open the picker overlay via `ctx.ui.custom()` — or, with
+   `start=<id> [end=<id>]` in the arguments, skip it (headless/RPC use). Remaining words
+   are focus text appended to the request.
+2. Picker returns `{ startId, endId }` or cancels. An unmarked end resolves to the latest
+   *content* entry, not the raw leaf, which is often bookkeeping.
+3. Apply settings: `pi.setModel()` / `pi.setThinkingLevel()` if configured, then
+   `pi.setActiveTools(["section_index", "section_read"])`.
+4. `appendCompaction(brief, null, tokensBefore, header, true)` on the underlying
+   `SessionManager`. `null` for `firstKeptEntryId` is what makes it retain-none
+   (`session-manager.js:890` stores the entry's own id). See
+   [Implementation notes](#implementation-notes) for why this is a cast.
 5. `pi.setLabel(compactionId, "§summary")` so it is findable in `/tree`.
-6. `pi.sendUserMessage(summarizerPrompt)` — triggers the turn immediately when idle.
-7. The user reads the summary, asks follow-ups on the branch, and leaves via `/tree`
+6. `pi.sendMessage(card)` while idle and without a trigger: a visible marker, and pi's
+   normal append path, which refreshes its in-memory transcript.
+7. `pi.sendUserMessage(request)` — triggers the turn immediately when idle.
+8. The user reads the summary, asks follow-ups on the branch, and leaves via `/tree`
    whenever they want. Nothing auto-navigates.
 
 Leaving restores the main tool loadout by itself: `navigateTree` calls
@@ -89,9 +98,12 @@ own changing it back.
 
 ## Picker
 
-Wraps `TreeSelectorComponent` (exported from the package) inside `ctx.ui.custom()`, same
-pattern as `branch-view.ts`, restricted to the active root→leaf path so start/end are
-guaranteed to be ancestrally ordered by construction.
+Wraps `TreeSelectorComponent` (exported from the package) inside `ctx.ui.custom()`. Instead
+of patching its private filter, it is handed a pruned copy of the tree containing only the
+active root→leaf path, so every stock behavior is untouched and start/end are ancestrally
+ordered by construction. Marks are displayed through the public `TreeList.updateNodeLabel`
+on those copied nodes, so they never reach the session; `onLabelEdit` is cleared to disable
+label editing.
 
 | Key | Action |
 |---|---|
@@ -108,14 +120,19 @@ Mark rules:
 - max 2 marks; a third replaces the **closest** existing mark, so a mark is always an
   expand/shrink rather than a start/end flip;
 - earlier-in-branch is start regardless of mark order;
-- 1 mark means start, with end = current leaf;
-- 0 marks means the whole branch.
+- 1 mark means start, with end = the latest content entry;
+- 0 marks means the whole branch;
+- tab on a non-content entry (visible under the `all` filter) is ignored.
+
+`?` is printable, so the wrapper intercepts it before the stock list treats it as search
+input. The picker closes, the settings dialogs run, and it reopens with marks and cursor
+preserved.
 
 Marked rows render an inline `[start]` / `[end]` tag, recomputed on every toggle. The status
 line shows the resolved range and its size (entries, approx tokens).
 
-Settings overlay writes through to `~/.pi/agent/settings.json` under `"summary-surgery"`
-(`{ model?, thinking? }`), read at `session_start`. There is no timeout setting — the run is
+Settings are stored in their own `~/.pi/agent/summary-surgery.json` (`{ model?, thinking? }`)
+rather than pi's shared `settings.json`, which pi rewrites itself. There is no timeout setting — the run is
 a normal turn and esc aborts it like any other.
 
 ## Tools
@@ -179,16 +196,17 @@ the later refinement if forcing proves awkward.
 
 | Need | API |
 |---|---|
-| command | `pi.registerCommand("summary-surgery", { handler })` |
-| picker overlay | `ctx.ui.custom()`, `TreeSelectorComponent`, `matchesKey`, `Container`, `Text` |
-| tree data | `sessionManager.getTree()`, `getLeafId()`, `getBranch(id)`, `getEntry(id)` |
-| context reset | `sessionManager.appendCompaction(summary, null, tokensBefore, details, true)` |
+| command | `pi.registerCommand("summary", { handler })` |
+| picker overlay | `ctx.ui.custom()`, `TreeSelectorComponent`, `TreeList.updateNodeLabel`, `matchesKey` |
+| tree data | `sessionManager.getBranch(id)`, `getEntry(id)`, `getLabel(id)`, `getLeafId()` |
+| context reset | `SessionManager.appendCompaction(summary, null, tokensBefore, details, true)` |
 | findability | `pi.setLabel(id, "§summary")` |
-| tool loadout | `pi.setActiveTools([...])` |
-| model/thinking | `pi.setModel()`, `pi.setThinkingLevel()` |
+| marker + transcript refresh | `pi.sendMessage(card)` (idle, no trigger) |
+| tool loadout | `pi.setActiveTools([...])`, synced on `session_start` / `session_tree` |
+| model/thinking | `pi.setModel()`, `pi.setThinkingLevel()`, `getSupportedThinkingLevels` |
 | kick off the turn | `pi.sendUserMessage(prompt)` |
 | prompt override | `pi.on("before_agent_start")` → `{ systemPrompt }` |
-| sizing | `estimateTokens`, `calculateContextTokens`, `ctx.getContextUsage()` |
+| sizing | `ctx.getContextUsage()`, entry usage, rendered character counts |
 | tools | `pi.registerTool()` with typebox schemas |
 
 ## Known behaviors
@@ -217,12 +235,30 @@ the later refinement if forcing proves awkward.
 - **`/subagents` does not list it,** because there is no subagent. `/tree` and the `§summary`
   label are the entry points.
 
-## Build order
+- **claude-bridge.** The bridge syncs its Claude Code session from the messages pi hands it.
+  Entering a summary branch is caught by its shorter-than-cursor guard and rebuilds; leaving
+  fires `session_tree`, which it answers with `markRebuild`. The raw append emits no
+  `session_compact`, so entry relies on the length guard alone: a main branch of about one
+  exchange could satisfy it and resume the main Claude Code session for the summarizer. Not
+  reachable for realistic ranges; the robust fix is on the bridge side (treat a new
+  compaction on the path as divergence, as `recoverSharedSessionFromEntries` already does).
 
-1. `range.ts` + `picker.ts` — exercise marking, validation, and slicing with a temporary
-   command that just reports the resolved range. No model involved.
-2. `tools.ts` — index/read, testable from the main branch against a hand-written range.
-3. `index.ts` + `prompt.ts` — compaction header, prompt, forced system prompt, settings.
+## Implementation notes
+
+- **Extensions get a `ReadonlySessionManager`** (`types.d.ts:220`), without
+  `appendCompaction`. The supported way for an extension to write a compaction is a
+  `CompactionEntryDraft` returned from `turn_end` / `agent_before_settle`, which only exists
+  inside an agent run. `/summary` runs while idle, before any turn, so it appends through the
+  underlying `SessionManager`; at runtime `ctx.sessionManager` is that object.
+- **Every provider request is rebuilt from the session projection**
+  (`_installAgentRequestProjection`, `agent-session.js:309`), not from pi's in-memory
+  transcript, so the raw append is seen by the next request regardless. What it skips is
+  bookkeeping: no `entry_appended` event and no transcript refresh. The idle `sendMessage`
+  card goes through pi's normal append path, which does both.
+- **Tests.** `test/summary.test.ts` drives a real `AgentSession` with pi-ai's faux provider
+  and asserts, per summarizer request, that the model saw only the brief, the two tools and
+  the forced prompt, and that navigating back restores the main context and loadout.
+  `test/picker.test.ts` feeds key sequences into the real `TreeSelectorComponent`.
 
 ## Non-goals
 
